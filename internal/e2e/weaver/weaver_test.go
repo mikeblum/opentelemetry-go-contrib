@@ -31,8 +31,10 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
-const weaverImage = "otel/weaver"
-const weaverTag = "v0.23.0"
+const (
+	weaverImage = "otel/weaver"
+	weaverTag   = "v0.23.0"
+)
 
 // TestWeaverLiveCheck spins up a weaver container via dockertest, exercises
 // otelhttp instrumentation against it, and validates the resulting
@@ -78,7 +80,8 @@ func TestWeaverLiveCheck(t *testing.T) {
 
 	// Wait for the OTLP gRPC listener inside the container to accept connections.
 	if err := pool.Retry(func() error {
-		conn, dialErr := net.DialTimeout("tcp", otlpEndpoint, 2*time.Second)
+		dialer := &net.Dialer{Timeout: 2 * time.Second}
+		conn, dialErr := dialer.DialContext(t.Context(), "tcp", otlpEndpoint)
 		if dialErr != nil {
 			return dialErr
 		}
@@ -87,7 +90,7 @@ func TestWeaverLiveCheck(t *testing.T) {
 		t.Fatalf("weaver OTLP listener not ready: %v", err)
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	shutdown, err := initOTLP(ctx, otlpEndpoint)
 	if err != nil {
