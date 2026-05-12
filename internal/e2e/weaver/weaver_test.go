@@ -1,20 +1,20 @@
-// Copyright The OpenTelemetry Authors
+// CopyrWeaverThe OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
 package weaver_test
 
 import (
-	"archive/tar"
-	"bytes"
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sort"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,9 +49,14 @@ func TestWeaverLiveCheck(t *testing.T) {
 		t.Skipf("skipping: docker not available: %v", err)
 	}
 	if err := pool.Client.Ping(); err != nil {
-		t.Skipf("skipping: docker daemon not reachable: %v", err)
+		t.Skipf("skipping: docker daemon not reachable: DOCKER_HOST=%q: %v", os.Getenv("DOCKER_HOST"), err)
 	}
 	pool.MaxWait = 2 * time.Minute
+
+	reportsDir := t.TempDir()
+	if err := os.Chmod(reportsDir, 0o777); err != nil {
+		t.Fatalf("chmod reports dir: %v", err)
+	}
 
 	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
 		Repository: weaverImage,
@@ -65,6 +70,7 @@ func TestWeaverLiveCheck(t *testing.T) {
 		ExposedPorts: []string{"4317/tcp"},
 	}, func(config *docker.HostConfig) {
 		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
+		config.Binds = []string{reportsDir + ":/reports"}
 	})
 	if err != nil {
 		t.Fatalf("start weaver container: %v", err)
@@ -74,6 +80,8 @@ func TestWeaverLiveCheck(t *testing.T) {
 			t.Logf("purge weaver container: %v", purgeErr)
 		}
 	})
+
+	waitLogs := streamWeaverLogs(t, pool, resource.Container.ID)
 
 	otlpEndpoint := fmt.Sprintf("localhost:%s", resource.GetPort("4317/tcp"))
 	t.Logf("weaver OTLP endpoint: %s", otlpEndpoint)
@@ -115,12 +123,13 @@ func TestWeaverLiveCheck(t *testing.T) {
 	shutdown = nil
 
 	exitCode, err := waitForWeaver(ctx, pool, resource.Container.ID)
+	waitLogs()
 	if err != nil {
 		t.Fatalf("wait for weaver live-check: %v", err)
 	}
-	t.Logf("weaver live-check exit code: %d (warn-only)", exitCode)
+	t.Logf("weaver live-check exit code: %d", exitCode)
 
-	reports, err := downloadReports(ctx, pool, resource.Container.ID)
+	reports, err := readWeaverReports(reportsDir)
 	if err != nil {
 		t.Fatalf("download weaver reports: %v", err)
 	}
@@ -128,6 +137,12 @@ func TestWeaverLiveCheck(t *testing.T) {
 		t.Fatal("weaver did not produce any JSON reports")
 	}
 	logReports(t, reports)
+
+	outDir := os.Getenv("WEAVER_REPORTS_DIR")
+	if outDir == "" {
+		outDir = "testdata"
+	}
+	writeReports(t, reports, outDir)
 }
 
 // initOTLP configures the global TracerProvider and MeterProvider with
@@ -201,36 +216,62 @@ func waitForWeaver(ctx context.Context, pool *dockertest.Pool, containerID strin
 	return exitCode, nil
 }
 
-func downloadReports(ctx context.Context, pool *dockertest.Pool, containerID string) (map[string]string, error) {
-	var archive bytes.Buffer
-	if err := pool.Client.DownloadFromContainer(containerID, docker.DownloadFromContainerOptions{
-		OutputStream: &archive,
-		Path:         "/reports",
-		Context:      ctx,
-	}); err != nil {
+func streamWeaverLogs(t *testing.T, pool *dockertest.Pool, containerID string) func() {
+	t.Helper()
+	logPR, logPW := io.Pipe()
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		scanner := bufio.NewScanner(logPR)
+		for scanner.Scan() {
+			t.Logf("weaver: %s", scanner.Text())
+		}
+	})
+	wg.Go(func() {
+		defer logPW.Close()
+		_ = pool.Client.Logs(docker.LogsOptions{
+			Context:      t.Context(),
+			Container:    containerID,
+			OutputStream: logPW,
+			ErrorStream:  logPW,
+			Stdout:       true,
+			Stderr:       true,
+			Follow:       true,
+		})
+	})
+	return wg.Wait
+}
+
+func readWeaverReports(dir string) (map[string]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
 		return nil, err
 	}
-
 	reports := make(map[string]string)
-	tr := tar.NewReader(&archive)
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
 		}
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
 		if err != nil {
 			return nil, err
 		}
-		if header.FileInfo().IsDir() || filepath.Ext(header.Name) != ".json" {
-			continue
-		}
-		var b strings.Builder
-		if _, err := io.Copy(&b, tr); err != nil {
-			return nil, err
-		}
-		reports[header.Name] = b.String()
+		reports[entry.Name()] = string(data)
 	}
 	return reports, nil
+}
+
+func writeReports(t *testing.T, reports map[string]string, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create reports output dir %s: %v", dir, err)
+	}
+	for name, content := range reports {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write report %s: %v", path, err)
+		}
+		t.Logf("wrote weaver report: %s", path)
+	}
 }
 
 func logReports(t *testing.T, reports map[string]string) {
