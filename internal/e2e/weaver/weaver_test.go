@@ -1,4 +1,4 @@
-// CopyrWeaverThe OpenTelemetry Authors
+// Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
 package weaver_test
@@ -6,44 +6,72 @@ package weaver_test
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials/insecure"
 
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
+	gRPCPort    = "4317/tcp"
 	weaverImage = "otel/weaver"
 	weaverTag   = "v0.23.0"
 )
 
-// TestWeaverLiveCheck spins up a weaver container via dockertest, exercises
-// otelhttp instrumentation against it, and validates the resulting
-// live-check report.
+// WeaverLiveCheck is implemented by each instrumentation to exercise its
+// telemetry and generate a weaver live-check report.
+type WeaverLiveCheck interface {
+	// Name is used as the t.Run subtest name and the testdata subdirectory.
+	Name() string
+	// Exercise generates telemetry through the instrumentation under test.
+	// tp and mp are scoped to a single container run — do not use global providers.
+	Exercise(t *testing.T, ctx context.Context, tp trace.TracerProvider, mp metric.MeterProvider)
+}
+
+var checks = []WeaverLiveCheck{
+	otelHTTPCheck{},
+	otelgrpcCheck{},
+	hostCheck{},
+}
+
 func TestWeaverLiveCheck(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping weaver live-check in short mode")
 	}
+	pool := setupDockerPool(t)
 
+	for _, check := range checks {
+		t.Run(check.Name(), func(t *testing.T) {
+			t.Parallel()
+			reports := runWeaverCheck(t, pool, check)
+			reports = normalizeReports(reports)
+			outDir := filepath.Join(reportsBaseDir(), check.Name())
+			writeReports(t, reports, outDir)
+		})
+	}
+}
+
+func setupDockerPool(t *testing.T) *dockertest.Pool {
+	t.Helper()
 	pool, err := dockertest.NewPool("")
 	if err != nil {
 		t.Skipf("skipping: docker not available: %v", err)
@@ -52,6 +80,18 @@ func TestWeaverLiveCheck(t *testing.T) {
 		t.Skipf("skipping: docker daemon not reachable: DOCKER_HOST=%q: %v", os.Getenv("DOCKER_HOST"), err)
 	}
 	pool.MaxWait = 2 * time.Minute
+	return pool
+}
+
+func reportsBaseDir() string {
+	if d := os.Getenv("WEAVER_REPORTS_DIR"); d != "" {
+		return d
+	}
+	return "testdata"
+}
+
+func runWeaverCheck(t *testing.T, pool *dockertest.Pool, check WeaverLiveCheck) map[string]string {
+	t.Helper()
 
 	reportsDir := t.TempDir()
 	if err := os.Chmod(reportsDir, 0o777); err != nil {
@@ -65,9 +105,9 @@ func TestWeaverLiveCheck(t *testing.T) {
 			"registry", "live-check",
 			"--format", "json",
 			"--output", "/reports",
-			"--inactivity-timeout", "30",
+			"--inactivity-timeout", "30", // seconds
 		},
-		ExposedPorts: []string{"4317/tcp"},
+		ExposedPorts: []string{gRPCPort},
 	}, func(config *docker.HostConfig) {
 		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
 		config.Binds = []string{reportsDir + ":/reports"}
@@ -81,39 +121,57 @@ func TestWeaverLiveCheck(t *testing.T) {
 		}
 	})
 
-	waitLogs := streamWeaverLogs(t, pool, resource.Container.ID)
+	waitLogs := streamWeaverLogs(t, pool, resource.Container.ID, check.Name())
 
-	otlpEndpoint := fmt.Sprintf("localhost:%s", resource.GetPort("4317/tcp"))
+	otlpEndpoint := fmt.Sprintf("localhost:%s", resource.GetPort(gRPCPort))
 	t.Logf("weaver OTLP endpoint: %s", otlpEndpoint)
-
-	// Wait for the OTLP gRPC listener inside the container to accept connections.
-	if err := pool.Retry(func() error {
-		dialer := &net.Dialer{Timeout: 2 * time.Second}
-		conn, dialErr := dialer.DialContext(t.Context(), "tcp", otlpEndpoint)
-		if dialErr != nil {
-			return dialErr
-		}
-		return conn.Close()
-	}); err != nil {
-		t.Fatalf("weaver OTLP listener not ready: %v", err)
-	}
 
 	ctx := t.Context()
 
-	shutdown, err := initOTLP(ctx, otlpEndpoint)
+	// Probe until the gRPC service is Ready, not just the TCP port.
+	// Weaver binds the port before the HTTP/2 layer is initialized, so a
+	// plain TCP dial would pass too early and produce "server preface" errors.
+	if err := pool.Retry(func() error {
+		probeConn, err := grpc.NewClient(
+			otlpEndpoint,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			return err
+		}
+		defer probeConn.Close()
+		probeConn.Connect()
+		probeCtx, probeCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer probeCancel()
+		for {
+			state := probeConn.GetState()
+			if state == connectivity.Ready {
+				return nil
+			}
+			if !probeConn.WaitForStateChange(probeCtx, state) {
+				return probeCtx.Err()
+			}
+		}
+	}); err != nil {
+		t.Fatalf("weaver OTLP gRPC not ready: %v", err)
+	}
+
+	tp, mp, shutdown, err := initOTLP(ctx, otlpEndpoint)
 	if err != nil {
 		t.Fatalf("init OTLP: %v", err)
 	}
 	defer func() {
-		if shutdown == nil {
+		fn := shutdown
+		shutdown = nil // prevent double-call if explicit shutdown below fails
+		if fn == nil {
 			return
 		}
-		if shutdownErr := shutdown(ctx); shutdownErr != nil {
+		if shutdownErr := fn(ctx); shutdownErr != nil {
 			t.Logf("shutdown OTLP: %v", shutdownErr)
 		}
 	}()
 
-	exerciseOtelHTTP(t, ctx)
+	check.Exercise(t, ctx, tp, mp)
 
 	shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -127,51 +185,41 @@ func TestWeaverLiveCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wait for weaver live-check: %v", err)
 	}
-	t.Logf("weaver live-check exit code: %d", exitCode)
+	t.Logf("weaver: live-check exit code: %d", exitCode)
 
 	reports, err := readWeaverReports(reportsDir)
 	if err != nil {
-		t.Fatalf("download weaver reports: %v", err)
+		t.Fatalf("read weaver reports: %v", err)
 	}
 	if len(reports) == 0 {
 		t.Fatal("weaver did not produce any JSON reports")
 	}
-	logReports(t, reports)
-
-	outDir := os.Getenv("WEAVER_REPORTS_DIR")
-	if outDir == "" {
-		outDir = "testdata"
-	}
-	writeReports(t, reports, outDir)
+	return reports
 }
 
-// initOTLP configures the global TracerProvider and MeterProvider with
-// OTLP gRPC exporters pointing at the given endpoint.
-func initOTLP(ctx context.Context, endpoint string) (func(context.Context) error, error) {
+func initOTLP(ctx context.Context, endpoint string) (trace.TracerProvider, metric.MeterProvider, func(context.Context) error, error) {
 	traceExp, err := otlptracegrpc.New(ctx,
 		otlptracegrpc.WithEndpoint(endpoint),
 		otlptracegrpc.WithInsecure(),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("trace exporter: %w", err)
+		return nil, nil, nil, fmt.Errorf("trace exporter: %w", err)
 	}
 	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(traceExp))
-	otel.SetTracerProvider(tp)
-	otel.SetTextMapPropagator(propagation.TraceContext{})
 
 	metricExp, err := otlpmetricgrpc.New(ctx,
 		otlpmetricgrpc.WithEndpoint(endpoint),
 		otlpmetricgrpc.WithInsecure(),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("metric exporter: %w", err)
+		_ = tp.Shutdown(ctx)
+		return nil, nil, nil, fmt.Errorf("metric exporter: %w", err)
 	}
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExp)),
 	)
-	otel.SetMeterProvider(mp)
 
-	return func(c context.Context) error {
+	return tp, mp, func(c context.Context) error {
 		tpErr := tp.Shutdown(c)
 		mpErr := mp.Shutdown(c)
 		if tpErr != nil {
@@ -216,14 +264,14 @@ func waitForWeaver(ctx context.Context, pool *dockertest.Pool, containerID strin
 	return exitCode, nil
 }
 
-func streamWeaverLogs(t *testing.T, pool *dockertest.Pool, containerID string) func() {
+func streamWeaverLogs(t *testing.T, pool *dockertest.Pool, containerID, name string) func() {
 	t.Helper()
 	logPR, logPW := io.Pipe()
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		scanner := bufio.NewScanner(logPR)
 		for scanner.Scan() {
-			t.Logf("weaver: %s", scanner.Text())
+			t.Logf("weaver(%s): %s", name, scanner.Text())
 		}
 	})
 	wg.Go(func() {
@@ -270,58 +318,127 @@ func writeReports(t *testing.T, reports map[string]string, dir string) {
 		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			t.Fatalf("write report %s: %v", path, err)
 		}
-		t.Logf("wrote weaver report: %s", path)
+		t.Logf("weaver: report: %s", path)
 	}
 }
 
-func logReports(t *testing.T, reports map[string]string) {
-	t.Helper()
-
-	names := make([]string, 0, len(reports))
-	for name := range reports {
-		names = append(names, name)
+// normalizeReports stabilizes all reports for committed golden files.
+func normalizeReports(reports map[string]string) map[string]string {
+	out := make(map[string]string, len(reports))
+	for name, content := range reports {
+		normalized, err := normalizeReport([]byte(content))
+		if err != nil {
+			out[name] = content
+			continue
+		}
+		out[name] = string(normalized)
 	}
-	sort.Strings(names)
-
-	for _, name := range names {
-		report := reports[name]
-		t.Logf("weaver report %s:\n%s", name, report)
-	}
+	return out
 }
 
-// exerciseOtelHTTP spins up a local test server wrapped with otelhttp
-// and issues requests through an instrumented client transport.
-func exerciseOtelHTTP(t *testing.T, ctx context.Context) {
-	t.Helper()
-
-	handler := otelhttp.NewHandler(
-		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ok"))
-		}),
-		"test-server",
-	)
-
-	srv := httptest.NewServer(handler)
-	defer srv.Close()
-
-	client := &http.Client{
-		Transport: otelhttp.NewTransport(http.DefaultTransport),
+// normalizeReport produces a deterministic JSON representation of a weaver live-check report
+func normalizeReport(data []byte) ([]byte, error) {
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil, err
 	}
+	normalizeSamples(root)
+	redactServiceName(root)
+	return json.MarshalIndent(root, "", "  ")
+}
 
-	for _, method := range []string{http.MethodGet, http.MethodPost} {
-		req, err := http.NewRequestWithContext(ctx, method, srv.URL+"/test", http.NoBody)
-		if err != nil {
-			t.Fatalf("new request: %v", err)
+// sampleTypeOrder defines canonical ordering: resources first, then spans, then metrics.
+var sampleTypeOrder = map[string]int{"resource": 0, "span": 1, "metric": 2}
+
+func normalizeSamples(root map[string]any) {
+	samples, ok := root["samples"].([]any)
+	if !ok {
+		return
+	}
+	for _, s := range samples {
+		sample, ok := s.(map[string]any)
+		if !ok {
+			continue
 		}
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("do request: %v", err)
+		for _, v := range sample {
+			if entity, ok := v.(map[string]any); ok {
+				sortAttributes(entity)
+			}
 		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("unexpected status code: %d", resp.StatusCode)
+	}
+	sort.SliceStable(samples, func(i, j int) bool {
+		ti, ni := sampleKey(samples[i])
+		tj, nj := sampleKey(samples[j])
+		if ti != tj {
+			return ti < tj
+		}
+		return ni < nj
+	})
+	root["samples"] = samples
+}
+
+func sampleKey(s any) (typeOrder int, name string) {
+	sample, ok := s.(map[string]any)
+	if !ok {
+		return 99, ""
+	}
+	for k, v := range sample {
+		order, known := sampleTypeOrder[k]
+		if !known {
+			return 99, k
+		}
+		if entity, ok := v.(map[string]any); ok {
+			if n, ok := entity["name"].(string); ok {
+				return order, n
+			}
+		}
+		return order, ""
+	}
+	return 99, ""
+}
+
+func sortAttributes(entity map[string]any) {
+	attrs, ok := entity["attributes"].([]any)
+	if !ok {
+		return
+	}
+	sort.SliceStable(attrs, func(i, j int) bool {
+		ai, _ := attrs[i].(map[string]any)
+		aj, _ := attrs[j].(map[string]any)
+		ni, _ := ai["name"].(string)
+		nj, _ := aj["name"].(string)
+		return ni < nj
+	})
+}
+
+func redactServiceName(root map[string]any) {
+	samples, ok := root["samples"].([]any)
+	if !ok {
+		return
+	}
+	for _, s := range samples {
+		sample, ok := s.(map[string]any)
+		if !ok {
+			continue
+		}
+		resource, ok := sample["resource"].(map[string]any)
+		if !ok {
+			continue
+		}
+		attrs, ok := resource["attributes"].([]any)
+		if !ok {
+			continue
+		}
+		for _, a := range attrs {
+			attr, ok := a.(map[string]any)
+			if !ok {
+				continue
+			}
+			if attr["name"] == "service.name" {
+				if v, ok := attr["value"].(string); ok && strings.HasPrefix(v, "unknown_service:") {
+					attr["value"] = "unknown_service"
+				}
+			}
 		}
 	}
 }
